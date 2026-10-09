@@ -1,0 +1,164 @@
+# .github/workflows/ci.yml
+# Runs on every PR — lint, type-check, and test all apps
+name: CI
+
+on:
+  pull_request:
+    branches: [main, develop]
+  push:
+    branches: [develop]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ─── Node.js (Next.js + packages) ───────────────────────────────────────────
+  web-ci:
+    name: Web — Lint, Type-check & Test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: .
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Lint (all packages)
+        run: pnpm turbo lint
+
+      - name: Type-check (all packages)
+        run: pnpm turbo typecheck
+
+      - name: Unit tests (Vitest)
+        run: pnpm turbo test
+
+      - name: Build (Next.js)
+        run: pnpm turbo build --filter=web
+        env:
+          NEXT_PUBLIC_API_URL: https://api.emptyshopfinder.in
+          NEXT_PUBLIC_RAZORPAY_KEY_ID: ${{ secrets.RAZORPAY_KEY_ID_TEST }}
+
+  # ─── Python (FastAPI core API) ───────────────────────────────────────────────
+  api-ci:
+    name: API — Lint, Type-check & Test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/api
+
+    services:
+      postgres:
+        image: supabase/postgres:15.1.0.117
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: esf_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          version: latest
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --all-extras
+
+      - name: Lint & format check (ruff)
+        run: uv run ruff check . && uv run ruff format --check .
+
+      - name: Type-check (mypy)
+        run: uv run mypy app/
+
+      - name: Run migrations
+        run: uv run alembic upgrade head
+        env:
+          DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/esf_test
+
+      - name: Run tests (pytest)
+        run: uv run pytest tests/ -v --cov=app --cov-report=xml --cov-fail-under=80
+        env:
+          DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/esf_test
+          REDIS_URL: redis://localhost:6379
+          JWT_SECRET: test-secret-key
+          JWT_ALGORITHM: HS256
+
+      - name: Upload coverage report
+        uses: codecov/codecov-action@v4
+        with:
+          file: apps/api/coverage.xml
+          flags: api
+
+  # ─── Python (AI service) ────────────────────────────────────────────────────
+  ai-ci:
+    name: AI Service — Lint & Test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/ai-service
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          version: latest
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --all-extras
+
+      - name: Lint & format check (ruff)
+        run: uv run ruff check . && uv run ruff format --check .
+
+      - name: Run tests
+        run: uv run pytest tests/ -v
+
+  # ─── Flutter (mobile) ───────────────────────────────────────────────────────
+  mobile-ci:
+    name: Mobile — Analyze & Test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/mobile
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: 3.24.0
+          channel: stable
+          cache: true
+
+      - name: Get Flutter packages
+        run: flutter pub get
+
+      - name: Analyze (flutter analyze)
+        run: flutter analyze
+
+      - name: Run unit tests
+        run: flutter test

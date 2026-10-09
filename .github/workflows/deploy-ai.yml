@@ -1,0 +1,75 @@
+name: Deploy AI Service → GCP Cloud Run
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "apps/ai-service/**"
+      - ".github/workflows/deploy-ai.yml"
+
+env:
+  GCP_REGION: asia-south1
+  SERVICE_NAME: esf-ai
+  IMAGE: asia-south1-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/esf/ai
+
+jobs:
+  deploy:
+    name: Build & Deploy AI Service
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker asia-south1-docker.pkg.dev --quiet
+
+      # AI service image is larger (HuggingFace model baked in) — use layer caching
+      - name: Build and push image
+        run: |
+          docker build \
+            --tag ${{ env.IMAGE }}:${{ github.sha }} \
+            --tag ${{ env.IMAGE }}:latest \
+            --cache-from ${{ env.IMAGE }}:latest \
+            --build-arg BUILDKIT_INLINE_CACHE=1 \
+            apps/ai-service/
+          docker push ${{ env.IMAGE }}:${{ github.sha }}
+          docker push ${{ env.IMAGE }}:latest
+
+      # AI service scales to ZERO when idle (cost = $0 at rest)
+      - name: Deploy to Cloud Run (scale-to-zero)
+        run: |
+          gcloud run deploy ${{ env.SERVICE_NAME }} \
+            --image ${{ env.IMAGE }}:${{ github.sha }} \
+            --region ${{ env.GCP_REGION }} \
+            --platform managed \
+            --memory 2Gi \
+            --cpu 2 \
+            --min-instances 0 \
+            --max-instances 5 \
+            --concurrency 10 \
+            --timeout 60s \
+            --no-allow-unauthenticated \
+            --set-secrets "DATABASE_URL=esf-database-url:latest" \
+            --set-env-vars "\
+              ENV=production,\
+              MODEL_NAME=sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2,\
+              MODEL_DIR=/app/models"
+
+      - name: Verify health
+        run: |
+          URL=$(gcloud run services describe ${{ env.SERVICE_NAME }} \
+            --region ${{ env.GCP_REGION }} \
+            --format "value(status.url)")
+          # Use service account auth to call internal endpoint
+          TOKEN=$(gcloud auth print-identity-token)
+          curl --fail --retry 3 -H "Authorization: Bearer $TOKEN" "$URL/health"

@@ -1,0 +1,106 @@
+name: Deploy API → GCP Cloud Run
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "apps/api/**"
+      - ".github/workflows/deploy-api.yml"
+
+env:
+  GCP_REGION: asia-south1
+  SERVICE_NAME: esf-api
+  IMAGE: asia-south1-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/esf/api
+
+jobs:
+  deploy:
+    name: Build, Migrate & Deploy
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write   # Required for Workload Identity Federation
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Authenticate to GCP using Workload Identity (no long-lived JSON key needed)
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      # Build & push Docker image to Artifact Registry
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker asia-south1-docker.pkg.dev --quiet
+
+      - name: Build and push image
+        run: |
+          docker build \
+            --tag ${{ env.IMAGE }}:${{ github.sha }} \
+            --tag ${{ env.IMAGE }}:latest \
+            --cache-from ${{ env.IMAGE }}:latest \
+            --build-arg BUILDKIT_INLINE_CACHE=1 \
+            apps/api/
+          docker push ${{ env.IMAGE }}:${{ github.sha }}
+          docker push ${{ env.IMAGE }}:latest
+
+      # Run DB migrations as a Cloud Run Job (before traffic switch)
+      - name: Run Alembic migrations
+        run: |
+          gcloud run jobs update esf-migrate \
+            --image ${{ env.IMAGE }}:${{ github.sha }} \
+            --region ${{ env.GCP_REGION }} \
+            --set-secrets "DATABASE_URL=esf-database-url:latest" \
+            --quiet || \
+          gcloud run jobs create esf-migrate \
+            --image ${{ env.IMAGE }}:${{ github.sha }} \
+            --region ${{ env.GCP_REGION }} \
+            --set-secrets "DATABASE_URL=esf-database-url:latest" \
+            --command "uv,run,alembic,upgrade,head"
+
+          gcloud run jobs execute esf-migrate \
+            --region ${{ env.GCP_REGION }} \
+            --wait
+
+      # Deploy new revision to Cloud Run
+      - name: Deploy to Cloud Run
+        run: |
+          gcloud run deploy ${{ env.SERVICE_NAME }} \
+            --image ${{ env.IMAGE }}:${{ github.sha }} \
+            --region ${{ env.GCP_REGION }} \
+            --platform managed \
+            --memory 1Gi \
+            --cpu 1 \
+            --min-instances 1 \
+            --max-instances 20 \
+            --concurrency 80 \
+            --timeout 30s \
+            --set-secrets "\
+              DATABASE_URL=esf-database-url:latest,\
+              REDIS_URL=esf-redis-url:latest,\
+              RAZORPAY_KEY_ID=esf-razorpay-key-id:latest,\
+              RAZORPAY_KEY_SECRET=esf-razorpay-key-secret:latest,\
+              MSG91_API_KEY=esf-msg91-key:latest,\
+              SIGNZY_API_KEY=esf-signzy-key:latest,\
+              CF_R2_ACCESS_KEY=esf-r2-access-key:latest,\
+              CF_R2_SECRET_KEY=esf-r2-secret-key:latest,\
+              JWT_SECRET=esf-jwt-secret:latest,\
+              MEILISEARCH_KEY=esf-meilisearch-key:latest" \
+            --set-env-vars "\
+              ENV=production,\
+              GCP_REGION=${{ env.GCP_REGION }},\
+              CF_ACCOUNT_ID=${{ vars.CF_ACCOUNT_ID }},\
+              CF_R2_BUCKET=${{ vars.CF_R2_BUCKET }},\
+              CF_PUBLIC_URL=${{ vars.CF_PUBLIC_URL }},\
+              MEILISEARCH_URL=${{ vars.MEILISEARCH_URL }},\
+              AI_SERVICE_URL=${{ vars.AI_SERVICE_URL }}"
+
+      - name: Verify deployment health
+        run: |
+          URL=$(gcloud run services describe ${{ env.SERVICE_NAME }} \
+            --region ${{ env.GCP_REGION }} \
+            --format "value(status.url)")
+          echo "Service URL: $URL"
+          curl --fail --retry 5 --retry-delay 5 "$URL/health"
